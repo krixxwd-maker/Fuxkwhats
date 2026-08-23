@@ -1,6 +1,6 @@
 // ============================================================
-//  KRIX – BACKGROUND VENOM (TERMUX CLI – FINAL)
-//  ✅ Pairing fix: no socket close/recreate during pairing
+//  KRIX – BACKGROUND VENOM (TERMUX CLI – 401 FIXED)
+//  ✅ Pairing retry 3x + QR fallback + session restore
 // ============================================================
 
 const crypto = require("crypto");
@@ -57,7 +57,7 @@ const state = {
     lastError: null,
     saveCreds: null,
     credsRegistered: false,
-    pairing: false        // ⬅️ NAYA FLAG
+    pairing: false
 };
 
 let socketLockPromise = null;
@@ -175,7 +175,7 @@ function isAuthFailure(statusCode, errMsg) {
 //  SOCKET CREATION
 // ============================================================
 
-async function createSocket(number, authPath) {
+async function createSocket(number, authPath, qr = false) {
     const oldClient = state.client;
     if (oldClient) {
         state.client = null;
@@ -211,9 +211,9 @@ async function createSocket(number, authPath) {
             creds: authState.creds,
             keys: makeCacheableSignalKeyStore(authState.keys, logger)
         },
-        printQRInTerminal: false,
+        printQRInTerminal: qr,
         logger: logger,
-        browser: Browsers.macOS('Safari'),
+        browser: Browsers.windows('Chrome'),
         syncFullHistory: false,
         shouldIgnoreJid: jid => isJidBroadcast(jid),
         getMessage: async () => ({})
@@ -242,7 +242,7 @@ function registerHandlers() {
 }
 
 // ============================================================
-//  CONNECTION UPDATE (PAIRING SAFE)
+//  CONNECTION UPDATE
 // ============================================================
 
 async function handleConnectionUpdate(update) {
@@ -254,7 +254,7 @@ async function handleConnectionUpdate(update) {
         state.authRequired = false;
         state.loggedOut = false;
         state.lastError = null;
-        state.pairing = false; // pairing complete
+        state.pairing = false;
         if (isNewLogin) console.log("🔑 New login established!");
         console.log("✅ Connected!");
         return;
@@ -270,9 +270,9 @@ async function handleConnectionUpdate(update) {
 
         console.log(`❌ Connection closed, code=${statusCode}, reason=${errMsg}`);
 
-        // ⬅️ Pairing ke waqt reconnect mat karo
+        // Pairing ke beech close hone par generatePairingCode loop handle karega
         if (state.pairing) {
-            console.log("⏳ Pairing in progress... waiting for phone to link.");
+            console.log("⏳ Pairing interrupted. Retrying with new code...");
             return;
         }
 
@@ -285,18 +285,16 @@ async function handleConnectionUpdate(update) {
             return;
         }
 
-        state.connectionState = "reconnecting";
         attemptReconnect().catch(e => console.error("Reconnect error:", e));
     }
 }
 
 // ============================================================
-//  RECONNECT (NO DUPLICATE SOCKET)
+//  RECONNECT
 // ============================================================
 
 async function attemptReconnect() {
-    if (state.pairing) return; // pairing ke beech reconnect nahi hoga
-
+    if (state.pairing) return;
     if (state.stopReconnect || state.loggedOut || state.reconnecting || socketLockPromise) return;
 
     state.reconnecting = true;
@@ -374,7 +372,7 @@ async function showMenu() {
 }
 
 // ============================================================
-//  AUTO RESTORE (Server Restart Ke Baad)
+//  AUTO RESTORE
 // ============================================================
 
 async function tryRestoreSession() {
@@ -411,7 +409,7 @@ async function tryRestoreSession() {
 }
 
 // ============================================================
-//  PAIRING (FINAL FIXED)
+//  PAIRING WITH RETRY + QR FALLBACK (401 FIX)
 // ============================================================
 
 async function generatePairingCode() {
@@ -426,76 +424,150 @@ async function generatePairingCode() {
     state.number = number;
     state.authPath = authPath;
 
+    // Already connected
     if (state.client && state.connected) {
         console.log("⚠️ Already connected. Use option 5 to logout first.");
         return;
     }
 
-    if (state.client && state.number === number && !state.loggedOut && !state.authRequired) {
-        if (state.credsRegistered) {
-            console.log("ℹ️ Session already registered. Waiting for connection...");
-            for (let i = 0; i < 30; i++) {
-                if (state.connected) break;
-                await delay(1000);
-            }
-            if (state.connected) console.log("✅ Connected.");
-            else console.log("⚠️ Not connected yet. It will auto-reconnect.");
-            return;
-        }
-        console.log("🔄 Using existing socket to request new pairing code...");
-    } else {
-        if (state.client && state.number !== number) {
-            await closeSocket(state.client);
-            state.client = null;
+    // Purana socket hatao (fresh start for pairing)
+    if (state.client) {
+        await closeSocket(state.client);
+        state.client = null;
+    }
+
+    let attempts = 0;
+    const maxAttempts = 3;
+
+    while (attempts < maxAttempts) {
+        attempts++;
+        if (attempts > 1) {
+            console.log(`\n🔄 Retry ${attempts}/${maxAttempts} – Naya pairing code generate ho raha hai...`);
         }
 
+        // Naya socket banao
         try {
             const socketData = await withSocketLock(() => createSocket(number, authPath));
             if (!socketData) return;
             registerHandlers();
         } catch (err) {
             console.error("❌ Socket creation failed:", err.message);
+            if (attempts >= maxAttempts) break;
+            await delay(3000);
+            continue;
+        }
+
+        if (state.credsRegistered) {
+            console.log("ℹ️ Session already registered. Use option 5 to logout.");
             return;
         }
+
+        state.pairing = true;
+        await delay(1500);
+
+        try {
+            const code = await withTimeout(
+                state.client.requestPairingCode(number),
+                30000,
+                "Pairing code request timed out"
+            );
+
+            console.log("\n==============================================");
+            console.log(`🔐 PAIRING CODE: ${code}`);
+            console.log("==============================================");
+            console.log("Enter this code in WhatsApp → Linked Devices → Link with phone number");
+            console.log("Waiting for connection (timeout: 60s)...");
+
+            // Wait for either "open" or "close"
+            let waitingError = null;
+            try {
+                await withTimeout(waitForPairingResult(), 60000, "Pairing timeout: code may have expired");
+            } catch (err) {
+                waitingError = err;
+            }
+
+            if (state.connected) {
+                console.log("✅ WhatsApp connected!");
+                state.pairing = false;
+                return;
+            }
+
+            if (waitingError) {
+                console.log(`⚠️ ${waitingError.message}`);
+                state.pairing = false;
+
+                // Agar socket close ho gaya, aur attempts baaki hain, retry karo
+                if (attempts < maxAttempts) {
+                    await delay(2000);
+                    continue;
+                }
+            }
+        } catch (err) {
+            console.error("❌ Pairing failed:", err.message);
+            state.pairing = false;
+            if (attempts >= maxAttempts) break;
+            await delay(3000);
+            continue;
+        } finally {
+            state.pairing = false;
+        }
     }
 
-    if (state.credsRegistered) {
-        console.log("ℹ️ Session already registered. Wait for connection or use option 5 to logout.");
-        return;
+    // Sab attempts fail → QR fallback
+    console.log("❌ Pairing code attempts failed. QR code se try karo...");
+    await fallbackToQR(number, authPath);
+}
+
+function waitForPairingResult() {
+    return new Promise((resolve, reject) => {
+        const client = state.client;
+        if (!client) return reject(new Error("No client"));
+
+        const onUpdate = (update) => {
+            if (update.connection === "open") {
+                cleanup();
+                resolve(true);
+            } else if (update.connection === "close") {
+                cleanup();
+                reject(new Error(`Socket closed during pairing (code=${state.lastDisconnectReason})`));
+            }
+        };
+
+        const cleanup = () => {
+            client.ev.removeListener("connection.update", onUpdate);
+        };
+
+        client.ev.on("connection.update", onUpdate);
+    });
+}
+
+async function fallbackToQR(number, authPath) {
+    if (state.client) {
+        await closeSocket(state.client);
+        state.client = null;
     }
 
-    await delay(1500);
-
-    // ⬅️ Pairing flag TRUE – reconnect abhi band
-    state.pairing = true;
+    console.log("🔄 Starting QR mode...");
 
     try {
-        const code = await withTimeout(
-            state.client.requestPairingCode(number),
-            30000,
-            "Pairing code request timed out"
-        );
+        const socketData = await withSocketLock(() => createSocket(number, authPath, true));
+        if (!socketData) return;
+        registerHandlers();
+        state.pairing = true;
 
-        console.log("\n==============================================");
-        console.log(`🔐 PAIRING CODE: ${code}`);
-        console.log("==============================================");
-        console.log("Enter this code in WhatsApp → Linked Devices → Link with phone number");
-        console.log("Waiting for connection...");
+        console.log("📱 Scan the QR code above with WhatsApp → Linked Devices → Link a device");
+        console.log("⏳ Waiting for scan (timeout: 120s)...");
 
-        for (let i = 0; i < 60; i++) {
-            if (state.connected) break;
-            await delay(1000);
+        try {
+            await withTimeout(waitForPairingResult(), 120000, "QR scan timeout");
+            if (state.connected) console.log("✅ WhatsApp connected!");
+        } catch (err) {
+            console.log(`⚠️ ${err.message}`);
         }
 
-        if (state.connected) {
-            console.log("✅ WhatsApp connected!");
-        } else {
-            console.log("⚠️ Not connected yet. Check if code was entered correctly.");
-        }
-    } catch (err) {
-        console.error("❌ Pairing failed:", err.message);
-    } finally {
         state.pairing = false;
+    } catch (err) {
+        console.error("❌ QR mode failed:", err.message);
     }
 }
 
