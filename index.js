@@ -1,6 +1,6 @@
 // ============================================================
-//  KRIX – BACKGROUND VENOM (TERMUX CLI FIXED)
-//  ✅ Pairing code fix, 401/408 safe reconnect, auto-restore
+//  KRIX – BACKGROUND VENOM (TERMUX CLI – FINAL)
+//  ✅ Pairing fix: no socket close/recreate during pairing
 // ============================================================
 
 const crypto = require("crypto");
@@ -56,7 +56,8 @@ const state = {
     reconnectAttempts: 0,
     lastError: null,
     saveCreds: null,
-    credsRegistered: false
+    credsRegistered: false,
+    pairing: false        // ⬅️ NAYA FLAG
 };
 
 let socketLockPromise = null;
@@ -175,7 +176,6 @@ function isAuthFailure(statusCode, errMsg) {
 // ============================================================
 
 async function createSocket(number, authPath) {
-    // ✅ Purane socket ko sahi tarike se close karo
     const oldClient = state.client;
     if (oldClient) {
         state.client = null;
@@ -242,7 +242,7 @@ function registerHandlers() {
 }
 
 // ============================================================
-//  CONNECTION UPDATE
+//  CONNECTION UPDATE (PAIRING SAFE)
 // ============================================================
 
 async function handleConnectionUpdate(update) {
@@ -254,6 +254,7 @@ async function handleConnectionUpdate(update) {
         state.authRequired = false;
         state.loggedOut = false;
         state.lastError = null;
+        state.pairing = false; // pairing complete
         if (isNewLogin) console.log("🔑 New login established!");
         console.log("✅ Connected!");
         return;
@@ -269,9 +270,14 @@ async function handleConnectionUpdate(update) {
 
         console.log(`❌ Connection closed, code=${statusCode}, reason=${errMsg}`);
 
+        // ⬅️ Pairing ke waqt reconnect mat karo
+        if (state.pairing) {
+            console.log("⏳ Pairing in progress... waiting for phone to link.");
+            return;
+        }
+
         if (state.stopReconnect) return;
 
-        // ✅ Genuine auth failure – sirf mark karo, folder delete mat karo
         if (isAuthFailure(statusCode, errMsg)) {
             state.loggedOut = true;
             state.authRequired = true;
@@ -279,7 +285,6 @@ async function handleConnectionUpdate(update) {
             return;
         }
 
-        // ✅ 408/515/connectionLost/timedOut – safe reconnect
         state.connectionState = "reconnecting";
         attemptReconnect().catch(e => console.error("Reconnect error:", e));
     }
@@ -290,6 +295,8 @@ async function handleConnectionUpdate(update) {
 // ============================================================
 
 async function attemptReconnect() {
+    if (state.pairing) return; // pairing ke beech reconnect nahi hoga
+
     if (state.stopReconnect || state.loggedOut || state.reconnecting || socketLockPromise) return;
 
     state.reconnecting = true;
@@ -298,10 +305,10 @@ async function attemptReconnect() {
         const oldClient = state.client;
         if (oldClient) {
             state.client = null;
-            await closeSocket(oldClient); // ✅ ab sahi client close hota hai
+            await closeSocket(oldClient);
         }
 
-        if (state.stopReconnect || state.loggedOut) return;
+        if (state.stopReconnect || state.loggedOut || state.pairing) return;
 
         state.reconnectAttempts++;
 
@@ -315,7 +322,7 @@ async function attemptReconnect() {
 
         await delay(backoff);
 
-        if (state.stopReconnect || state.loggedOut) return;
+        if (state.stopReconnect || state.loggedOut || state.pairing) return;
 
         backupAuth();
 
@@ -404,7 +411,7 @@ async function tryRestoreSession() {
 }
 
 // ============================================================
-//  PAIRING (FIXED)
+//  PAIRING (FINAL FIXED)
 // ============================================================
 
 async function generatePairingCode() {
@@ -419,13 +426,11 @@ async function generatePairingCode() {
     state.number = number;
     state.authPath = authPath;
 
-    // Already connected
     if (state.client && state.connected) {
         console.log("⚠️ Already connected. Use option 5 to logout first.");
         return;
     }
 
-    // Same session, same number, no auth failure => socket recreate mat karo
     if (state.client && state.number === number && !state.loggedOut && !state.authRequired) {
         if (state.credsRegistered) {
             console.log("ℹ️ Session already registered. Waiting for connection...");
@@ -437,10 +442,8 @@ async function generatePairingCode() {
             else console.log("⚠️ Not connected yet. It will auto-reconnect.");
             return;
         }
-
         console.log("🔄 Using existing socket to request new pairing code...");
     } else {
-        // Different number ya auth failure => purana socket close karke naya banao
         if (state.client && state.number !== number) {
             await closeSocket(state.client);
             state.client = null;
@@ -462,6 +465,9 @@ async function generatePairingCode() {
     }
 
     await delay(1500);
+
+    // ⬅️ Pairing flag TRUE – reconnect abhi band
+    state.pairing = true;
 
     try {
         const code = await withTimeout(
@@ -488,6 +494,8 @@ async function generatePairingCode() {
         }
     } catch (err) {
         console.error("❌ Pairing failed:", err.message);
+    } finally {
+        state.pairing = false;
     }
 }
 
@@ -656,6 +664,7 @@ async function logoutAndDelete() {
     state.stopReconnect = false;
     state.saveCreds = null;
     state.credsRegistered = false;
+    state.pairing = false;
     currentTask = null;
 
     console.log("✅ Session deleted. You can pair again.");
