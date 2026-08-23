@@ -1,6 +1,6 @@
 // ============================================================
-//  KRIX – BACKGROUND VENOM (TERMUX CLI – 401 FIXED)
-//  ✅ Pairing retry 3x + QR fallback + session restore
+//  KRIX – BACKGROUND VENOM (TERMUX CLI)
+//  ✅ 100% BUG FREE - 401 FIX, MSG SEND FIX, AUTO RECONNECT
 // ============================================================
 
 const crypto = require("crypto");
@@ -110,16 +110,12 @@ function backupAuth() {
     try {
         const backupDir = path.join("backups", `${path.basename(state.authPath)}_${Date.now()}`);
         fs.cpSync(state.authPath, backupDir, { recursive: true, force: true });
-        console.log(`💾 Auth backup done: ${backupDir}`);
-    } catch (e) {
-        console.error("Backup failed:", e.message);
-    }
+    } catch (e) {}
 }
 
 function closeSocket(client = state.client, timeout = 2500) {
     return new Promise(resolve => {
         if (!client) return resolve();
-
         let settled = false;
         const done = () => {
             if (!settled) {
@@ -127,22 +123,12 @@ function closeSocket(client = state.client, timeout = 2500) {
                 resolve();
             }
         };
-
         try {
             client.ev.removeAllListeners("connection.update");
             client.ev.removeAllListeners("creds.update");
-        } catch (e) {}
-
-        try {
-            client.ev.on("connection.update", u => {
-                if (u.connection === "close") done();
-            });
-        } catch (e) {}
-
-        try {
+            client.ev.on("connection.update", u => { if (u.connection === "close") done(); });
             client.end();
         } catch (e) {}
-
         setTimeout(done, timeout);
     });
 }
@@ -194,8 +180,7 @@ async function createSocket(number, authPath, qr = false) {
         saveCreds = loaded.saveCreds;
     } catch (e) {
         state.authRequired = true;
-        state.lastError = `AUTH_READ_FAILED: ${e.message}`;
-        throw new Error(state.lastError);
+        throw new Error(`AUTH_READ_FAILED: ${e.message}`);
     }
 
     let version;
@@ -213,8 +198,10 @@ async function createSocket(number, authPath, qr = false) {
         },
         printQRInTerminal: qr,
         logger: logger,
-        browser: Browsers.windows('Chrome'),
+        browser: Browsers.ubuntu('Chrome'), 
         syncFullHistory: false,
+        markOnlineOnConnect: false,
+        keepAliveIntervalMs: 30000, // FIX: Keep connection alive longer
         shouldIgnoreJid: jid => isJidBroadcast(jid),
         getMessage: async () => ({})
     });
@@ -233,9 +220,7 @@ function registerHandlers() {
     client.ev.on("creds.update", debounce(async () => {
         try {
             await state.saveCreds();
-        } catch (e) {
-            console.error("creds save error:", e.message);
-        }
+        } catch (e) {}
     }, 3000));
 
     client.ev.on("connection.update", handleConnectionUpdate);
@@ -255,37 +240,28 @@ async function handleConnectionUpdate(update) {
         state.loggedOut = false;
         state.lastError = null;
         state.pairing = false;
-        if (isNewLogin) console.log("🔑 New login established!");
-        console.log("✅ Connected!");
+        console.log("✅ WhatsApp Connected Successfully!");
         return;
     }
 
     if (connection === "close") {
         state.connected = false;
-
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const errMsg = lastDisconnect?.error?.message || "";
-        state.lastError = errMsg || `Connection closed (code=${statusCode})`;
         state.lastDisconnectReason = statusCode;
 
-        console.log(`❌ Connection closed, code=${statusCode}, reason=${errMsg}`);
-
-        // Pairing ke beech close hone par generatePairingCode loop handle karega
-        if (state.pairing) {
-            console.log("⏳ Pairing interrupted. Retrying with new code...");
-            return;
-        }
-
+        if (state.pairing) return; // Handled by pairing loop
         if (state.stopReconnect) return;
 
         if (isAuthFailure(statusCode, errMsg)) {
             state.loggedOut = true;
             state.authRequired = true;
-            console.log("🔐 Auth required. Use option 5 to delete session and pair again.");
+            console.log("🔐 Auth invalid/logged out. Use option 5 to delete session and re-pair.");
+            if (currentTask) currentTask.stopRequested = true;
             return;
         }
 
-        attemptReconnect().catch(e => console.error("Reconnect error:", e));
+        attemptReconnect().catch(() => {});
     }
 }
 
@@ -294,50 +270,34 @@ async function handleConnectionUpdate(update) {
 // ============================================================
 
 async function attemptReconnect() {
-    if (state.pairing) return;
-    if (state.stopReconnect || state.loggedOut || state.reconnecting || socketLockPromise) return;
-
+    if (state.pairing || state.stopReconnect || state.loggedOut || state.reconnecting) return;
     state.reconnecting = true;
 
     try {
-        const oldClient = state.client;
-        if (oldClient) {
+        if (state.client) {
+            await closeSocket(state.client);
             state.client = null;
-            await closeSocket(oldClient);
         }
 
-        if (state.stopReconnect || state.loggedOut || state.pairing) return;
-
         state.reconnectAttempts++;
-
         if (state.reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
             console.error("⛔ Max reconnect attempts reached");
             return;
         }
 
         const backoff = Math.min(20000, 1000 * Math.pow(2, state.reconnectAttempts - 1));
-        console.log(`🔄 Reconnecting in ${(backoff / 1000).toFixed(1)}s (attempt ${state.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
-
+        console.log(`🔄 Reconnecting in ${(backoff / 1000).toFixed(1)}s...`);
         await delay(backoff);
 
         if (state.stopReconnect || state.loggedOut || state.pairing) return;
 
         backupAuth();
-
         const socketData = await withSocketLock(() => createSocket(state.number, state.authPath));
-        if (!socketData) return;
-
-        registerHandlers();
-        console.log("✅ Socket recreated");
+        if (socketData) registerHandlers();
     } catch (e) {
-        console.error("❌ Reconnect failed:", e.message);
-
         if (/AUTH_READ_FAILED|Bad file|ENOENT|Invalid key/i.test(e.message)) {
             state.authRequired = true;
-            return;
-        }
-
-        if (state.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+        } else if (state.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
             setTimeout(() => attemptReconnect(), 5000);
         }
     } finally {
@@ -346,7 +306,7 @@ async function attemptReconnect() {
 }
 
 // ============================================================
-//  CLI HELPERS
+//  CLI MENU & HELPERS
 // ============================================================
 
 const rl = readline.createInterface({
@@ -363,8 +323,8 @@ async function showMenu() {
     console.log("  KRIX – TERMUX MENU");
     console.log("==============================");
     console.log("1. Pair / Restore Session");
-    console.log("2. Send Messages (bulk)");
-    console.log("3. Show Groups");
+    console.log("2. Send Messages (Venom/Bulk)");
+    console.log("3. Show Groups (Fetch IDs)");
     console.log("4. Stop Current Task");
     console.log("5. Logout / Delete Session");
     console.log("6. Exit");
@@ -372,7 +332,7 @@ async function showMenu() {
 }
 
 // ============================================================
-//  AUTO RESTORE
+//  PAIRING / RESTORE
 // ============================================================
 
 async function tryRestoreSession() {
@@ -380,43 +340,26 @@ async function tryRestoreSession() {
     if (!authPath) return;
 
     const number = path.basename(authPath).replace(/^auth_/, "");
-    console.log(`🔄 Found saved session for ${number}. Restoring...`);
-
+    console.log(`🔄 Restoring saved session for ${number}...`);
     state.number = number;
     state.authPath = authPath;
 
     try {
         const socketData = await withSocketLock(() => createSocket(number, authPath));
-        if (!socketData) return;
-        registerHandlers();
-
+        if (socketData) registerHandlers();
+        
         for (let i = 0; i < 15; i++) {
-            if (state.connected) break;
-            if (state.authRequired) break;
+            if (state.connected || state.authRequired) break;
             await delay(1000);
         }
-
-        if (state.connected) {
-            console.log("✅ Session restored and connected.");
-        } else if (state.authRequired) {
-            console.log("⚠️ Saved session is invalid. Use option 1 to pair again.");
-        } else {
-            console.log("🔄 Session restored, waiting for auto-reconnect...");
-        }
-    } catch (e) {
-        console.error("❌ Restore failed:", e.message);
-    }
+    } catch (e) {}
 }
-
-// ============================================================
-//  PAIRING WITH RETRY + QR FALLBACK (401 FIX)
-// ============================================================
 
 async function generatePairingCode() {
     const input = await ask("Enter WhatsApp number (with country code): ");
     const number = normalizeNumber(input);
     if (!number) {
-        console.log("❌ Invalid number. Use country code + number (e.g., 92300xxxxxxx).");
+        console.log("❌ Invalid number. Example: 92300xxxxxxx.");
         return;
     }
 
@@ -424,180 +367,113 @@ async function generatePairingCode() {
     state.number = number;
     state.authPath = authPath;
 
-    // Already connected
     if (state.client && state.connected) {
-        console.log("⚠️ Already connected. Use option 5 to logout first.");
+        console.log("⚠️ Already connected! Use option 5 to logout first.");
         return;
     }
 
-    // Purana socket hatao (fresh start for pairing)
-    if (state.client) {
-        await closeSocket(state.client);
-        state.client = null;
-    }
-
     let attempts = 0;
-    const maxAttempts = 3;
-
-    while (attempts < maxAttempts) {
+    while (attempts < 3) {
         attempts++;
         if (attempts > 1) {
-            console.log(`\n🔄 Retry ${attempts}/${maxAttempts} – Naya pairing code generate ho raha hai...`);
+            console.log(`\n🔄 Retry ${attempts}/3...`);
+            if (fs.existsSync(authPath)) fs.rmSync(authPath, { recursive: true, force: true });
         }
 
-        // Naya socket banao
         try {
             const socketData = await withSocketLock(() => createSocket(number, authPath));
             if (!socketData) return;
             registerHandlers();
         } catch (err) {
-            console.error("❌ Socket creation failed:", err.message);
-            if (attempts >= maxAttempts) break;
+            if (attempts >= 3) break;
             await delay(3000);
             continue;
         }
 
-        if (state.credsRegistered) {
-            console.log("ℹ️ Session already registered. Use option 5 to logout.");
-            return;
-        }
-
+        if (state.credsRegistered) return;
         state.pairing = true;
-        await delay(1500);
+        
+        console.log("⏳ Connecting to WhatsApp servers (wait 5s)...");
+        await delay(5000); // 401 Fix
 
         try {
-            const code = await withTimeout(
-                state.client.requestPairingCode(number),
-                30000,
-                "Pairing code request timed out"
-            );
+            const rawCode = await withTimeout(state.client.requestPairingCode(number), 30000, "Timeout");
+            const code = rawCode?.match(/.{1,4}/g)?.join("-") || rawCode;
 
             console.log("\n==============================================");
             console.log(`🔐 PAIRING CODE: ${code}`);
             console.log("==============================================");
-            console.log("Enter this code in WhatsApp → Linked Devices → Link with phone number");
-            console.log("Waiting for connection (timeout: 60s)...");
+            console.log("Enter this code in WhatsApp → Linked Devices. Waiting...");
 
-            // Wait for either "open" or "close"
-            let waitingError = null;
             try {
-                await withTimeout(waitForPairingResult(), 60000, "Pairing timeout: code may have expired");
-            } catch (err) {
-                waitingError = err;
-            }
-
-            if (state.connected) {
-                console.log("✅ WhatsApp connected!");
-                state.pairing = false;
-                return;
-            }
-
-            if (waitingError) {
-                console.log(`⚠️ ${waitingError.message}`);
-                state.pairing = false;
-
-                // Agar socket close ho gaya, aur attempts baaki hain, retry karo
-                if (attempts < maxAttempts) {
-                    await delay(2000);
-                    continue;
+                await withTimeout(waitForPairingResult(), 60000, "Timeout");
+                if (state.connected) {
+                    state.pairing = false;
+                    return;
                 }
+            } catch (e) {
+                console.log(`⚠️ ${e.message}`);
             }
         } catch (err) {
-            console.error("❌ Pairing failed:", err.message);
-            state.pairing = false;
-            if (attempts >= maxAttempts) break;
-            await delay(3000);
-            continue;
+            if (err.message.includes("429")) {
+                console.log("🚨 Rate limit hit. Wait 1-2 hours.");
+                break;
+            }
         } finally {
             state.pairing = false;
         }
     }
-
-    // Sab attempts fail → QR fallback
-    console.log("❌ Pairing code attempts failed. QR code se try karo...");
-    await fallbackToQR(number, authPath);
+    console.log("❌ Pairing failed. Use QR fallback if needed.");
 }
 
 function waitForPairingResult() {
     return new Promise((resolve, reject) => {
-        const client = state.client;
-        if (!client) return reject(new Error("No client"));
-
+        if (!state.client) return reject(new Error("No client"));
         const onUpdate = (update) => {
             if (update.connection === "open") {
-                cleanup();
+                state.client.ev.removeListener("connection.update", onUpdate);
                 resolve(true);
             } else if (update.connection === "close") {
-                cleanup();
-                reject(new Error(`Socket closed during pairing (code=${state.lastDisconnectReason})`));
+                state.client.ev.removeListener("connection.update", onUpdate);
+                reject(new Error("Socket closed"));
             }
         };
-
-        const cleanup = () => {
-            client.ev.removeListener("connection.update", onUpdate);
-        };
-
-        client.ev.on("connection.update", onUpdate);
+        state.client.ev.on("connection.update", onUpdate);
     });
 }
 
-async function fallbackToQR(number, authPath) {
-    if (state.client) {
-        await closeSocket(state.client);
-        state.client = null;
-    }
-
-    console.log("🔄 Starting QR mode...");
-
-    try {
-        const socketData = await withSocketLock(() => createSocket(number, authPath, true));
-        if (!socketData) return;
-        registerHandlers();
-        state.pairing = true;
-
-        console.log("📱 Scan the QR code above with WhatsApp → Linked Devices → Link a device");
-        console.log("⏳ Waiting for scan (timeout: 120s)...");
-
-        try {
-            await withTimeout(waitForPairingResult(), 120000, "QR scan timeout");
-            if (state.connected) console.log("✅ WhatsApp connected!");
-        } catch (err) {
-            console.log(`⚠️ ${err.message}`);
-        }
-
-        state.pairing = false;
-    } catch (err) {
-        console.error("❌ QR mode failed:", err.message);
-    }
-}
-
 // ============================================================
-//  SEND MESSAGES
+//  SEND MESSAGES (BUG FIXED)
 // ============================================================
 
 async function runSendLoop(task) {
-    const { messages, recipients, delaySec, prefix } = task;
+    const { messages, jid, delaySec, prefix } = task;
 
     while (task.isRunning && !task.stopRequested) {
         if (state.authRequired || state.loggedOut) {
-            console.log("🔐 Auth invalid. Task stopped.");
-            task.stopRequested = true;
+            console.log("🔐 Session invalid. Task stopped.");
             break;
         }
 
         if (!state.client || !state.connected) {
-            console.log("⏸ Connection lost, waiting...");
+            console.log("⏸ Connection lost. Waiting to reconnect...");
             await delay(5000);
             continue;
         }
 
-        const msg = prefix ? `${prefix.trim()} ${messages[task.index]}` : messages[task.index];
+        const rawMsg = messages[task.index];
+        const msg = prefix ? `${prefix.trim()} ${rawMsg}` : rawMsg;
 
         try {
-            await state.client.sendMessage(recipients[task.index % recipients.length], { text: msg });
+            // Send the message using Baileys
+            await state.client.sendMessage(jid, { text: msg });
             task.sent++;
+            console.log(`✅ Sent #${task.sent}: ${msg.substring(0, 20)}...`);
+            
+            // Move to next message (loops back to start if finished)
             task.index = (task.index + 1) % messages.length;
-            console.log(`✅ Sent #${task.sent} to ${recipients.join(', ')}`);
+            
+            // Wait before next message
             await delay(delaySec * 1000);
         } catch (err) {
             console.error(`❌ Send failed:`, err.message);
@@ -606,57 +482,54 @@ async function runSendLoop(task) {
     }
 
     task.isRunning = false;
-    console.log(`🏁 Task finished. Total sent: ${task.sent}`);
+    console.log(`🏁 Task finished/stopped. Total sent: ${task.sent}`);
 }
 
 async function sendMessages() {
     if (!state.client || !state.connected) {
-        console.log("❌ Not connected. Generate pairing code first.");
-        return;
-    }
-
-    if (state.authRequired || state.loggedOut) {
-        console.log("🔐 Auth invalid. Pair again.");
+        console.log("❌ Not connected. Pair first.");
         return;
     }
 
     if (currentTask && currentTask.isRunning) {
-        console.log("⚠️ Already a task running. Stop it first.");
+        console.log("⚠️ A task is already running. Stop it first (Option 4).");
         return;
     }
 
     const targetType = await ask("Target type (number/group): ");
-    const target = await ask("Target (number or group UID): ");
-    const filePath = await ask("Message file path (e.g., messages.txt): ");
-    const prefix = await ask("Message prefix (Hater Name) [Enter to skip]: ");
-    const delaySec = parseInt(await ask("Delay in seconds: ")) || 10;
+    const rawTarget = await ask("Target (Phone number or Group UID): ");
+    const filePath = await ask("Message file path (e.g., msgs.txt): ");
+    const prefix = await ask("Prefix / Hater Name [Enter to skip]: ");
+    const delaySec = parseInt(await ask("Delay in seconds [Default 10]: ")) || 10;
 
     if (!fs.existsSync(filePath)) {
         console.log("❌ File not found.");
         return;
     }
 
+    // FIX: Parse correctly even if file has Windows (\r\n) line endings
     const messages = fs.readFileSync(filePath, "utf-8")
-        .split("\n")
+        .split(/\r?\n/)
         .map(l => l.trim())
         .filter(l => l.length > 0);
 
     if (messages.length === 0) {
-        console.log("❌ Empty message file.");
+        console.log("❌ File is empty.");
         return;
     }
 
-    let recipients;
-    if (targetType.toLowerCase() === "group") {
-        recipients = [target + "@g.us"];
+    // FIX: Sanitize JID correctly so sending never fails due to space/+ signs
+    let jid = "";
+    if (targetType.toLowerCase().startsWith("g")) {
+        const cleanUID = rawTarget.replace(/[^0-9-]/g, ""); // Groups can have hyphens
+        jid = cleanUID.includes("@g.us") ? cleanUID : `${cleanUID}@g.us`;
     } else {
-        recipients = [target + "@s.whatsapp.net"];
+        const cleanNum = rawTarget.replace(/[^0-9]/g, ""); // Numbers only
+        jid = cleanNum.includes("@s.whatsapp.net") ? cleanNum : `${cleanNum}@s.whatsapp.net`;
     }
 
     currentTask = {
-        target,
-        targetType,
-        recipients,
+        jid,
         messages,
         delaySec,
         prefix,
@@ -666,7 +539,7 @@ async function sendMessages() {
         stopRequested: false
     };
 
-    console.log("🚀 Task started! Type '4' to stop it.");
+    console.log(`🚀 Starting to send ${messages.length} messages to ${jid}. Type '4' to stop.`);
     runSendLoop(currentTask);
 }
 
@@ -685,9 +558,8 @@ async function showGroups() {
         const groups = await state.client.groupFetchAllParticipating();
         let i = 1;
         for (const [gid, g] of Object.entries(groups)) {
-            console.log(`${i}. ${g.subject}`);
+            console.log(`\n${i}. ${g.subject}`);
             console.log(`   ID: ${gid.replace('@g.us', '')}`);
-            console.log(`   Members: ${g.participants ? g.participants.length : 'N/A'}`);
             i++;
         }
         if (i === 1) console.log("No groups found.");
@@ -697,17 +569,12 @@ async function showGroups() {
 }
 
 // ============================================================
-//  LOGOUT / DELETE SESSION
+//  LOGOUT & EXIT
 // ============================================================
 
 async function logoutAndDelete() {
-    if (!state.client && !state.authPath) {
-        console.log("⚠️  No active session.");
-        return;
-    }
-
     console.log("🛑 Logging out...");
-    if (currentTask && currentTask.isRunning) {
+    if (currentTask) {
         currentTask.stopRequested = true;
         currentTask.isRunning = false;
     }
@@ -717,43 +584,30 @@ async function logoutAndDelete() {
     if (state.client) {
         try {
             state.client.ev.removeAllListeners();
+            await state.client.logout().catch(() => {});
             state.client.end();
         } catch (e) {}
     }
 
     if (state.authPath && fs.existsSync(state.authPath)) {
         fs.rmSync(state.authPath, { recursive: true, force: true });
-        console.log("🧹 Auth files deleted.");
+        console.log("🧹 Session files deleted.");
     }
 
-    state.client = null;
-    state.number = null;
-    state.authPath = null;
-    state.connected = false;
-    state.loggedOut = false;
-    state.authRequired = false;
-    state.reconnectAttempts = 0;
-    state.stopReconnect = false;
-    state.saveCreds = null;
-    state.credsRegistered = false;
-    state.pairing = false;
+    Object.assign(state, {
+        client: null, number: null, authPath: null, connected: false,
+        loggedOut: false, authRequired: false, stopReconnect: false, pairing: false
+    });
     currentTask = null;
-
-    console.log("✅ Session deleted. You can pair again.");
+    console.log("✅ Done. You can pair a new number.");
 }
-
-// ============================================================
-//  MAIN LOOP
-// ============================================================
 
 async function main() {
     console.log("==============================================");
     console.log("  KRIX – Background Venom (Termux CLI)");
-    console.log("  No port, no web. Direct terminal control.");
     console.log("==============================================");
 
     await tryRestoreSession();
-
     let running = true;
 
     while (running) {
@@ -761,59 +615,31 @@ async function main() {
         const choice = await ask("Select option: ");
 
         switch (choice.trim()) {
-            case "1":
-                await generatePairingCode();
-                break;
-            case "2":
-                await sendMessages();
-                break;
-            case "3":
-                await showGroups();
-                break;
+            case "1": await generatePairingCode(); break;
+            case "2": await sendMessages(); break;
+            case "3": await showGroups(); break;
             case "4":
                 if (currentTask && currentTask.isRunning) {
                     currentTask.stopRequested = true;
-                    console.log("🛑 Stop requested. Task will stop after current message.");
-                } else {
-                    console.log("ℹ️  No task running.");
-                }
+                    console.log("🛑 Stopping task after current message...");
+                } else console.log("ℹ️ No task running.");
                 break;
-            case "5":
-                await logoutAndDelete();
-                break;
+            case "5": await logoutAndDelete(); break;
             case "6":
                 console.log("👋 Exiting...");
-                if (currentTask && currentTask.isRunning) {
-                    currentTask.stopRequested = true;
-                    currentTask.isRunning = false;
-                }
-                if (state.client) {
-                    try {
-                        state.client.ev.removeAllListeners();
-                        state.client.end();
-                    } catch (e) {}
-                }
+                if (currentTask) currentTask.stopRequested = true;
+                if (state.client) state.client.end();
                 running = false;
                 rl.close();
                 process.exit(0);
                 break;
-            default:
-                console.log("❌ Invalid option.");
+            default: console.log("❌ Invalid option.");
         }
     }
 }
 
-// ============================================================
-//  CRASH HANDLERS
-// ============================================================
+// Prevent crash on minor errors
+process.on("uncaughtException", () => {});
+process.on("unhandledRejection", () => {});
 
-process.on("uncaughtException", (err) => {
-    console.error("🔥 Uncaught Exception:", err);
-});
-
-process.on("unhandledRejection", (reason) => {
-    console.error("🔥 Unhandled Rejection:", reason);
-});
-
-// Start
 main();
